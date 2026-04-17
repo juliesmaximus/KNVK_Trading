@@ -1,0 +1,4 @@
+8:55 AM  python3 update_daily.py
+9:00 AM  python3 paper/signals_daily.py
+9:10 AM  python3 paper/runner.py status  (verify signals loaded)
+9:14 AM  python3 paper/runner.py         (start engine, enter TOTP)
