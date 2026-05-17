@@ -1,4 +1,5 @@
 # paper/order_manager.py — paper order lifecycle management
+# FIXED: Uses entry_price_live from signals (today's open price)
 
 import sys
 sys.path.append(str(__import__('pathlib').Path(__file__).parent.parent))
@@ -25,11 +26,17 @@ def get_open_trades() -> pd.DataFrame:
 
 def open_trade(signal_id: int, signal: dict) -> int:
     """
-    Convert a pending signal into an open paper trade.
+    FIX for Bug #1: Convert a pending signal into an open paper trade.
+    Uses entry_price_live (today's opening price) instead of yesterday's close.
     Called at 9:15 AM when market opens.
     Returns trade id.
     """
     conn = sqlite3.connect(DB_PATH)
+
+    # Use entry_price_live if available, fallback to entry_price_signal
+    entry_price = signal.get("entry_price_live", 0)
+    if entry_price <= 0:
+        entry_price = signal.get("entry_price_signal", signal.get("entry_price", 0))
 
     cursor = conn.execute("""
         INSERT INTO paper_trades
@@ -41,7 +48,7 @@ def open_trade(signal_id: int, signal: dict) -> int:
         signal_id,
         signal["symbol"],
         date.today().strftime("%Y-%m-%d"),
-        signal["entry_price"],
+        entry_price,
         signal["direction"],
         signal["qty"],
         signal["stop_price"],
@@ -62,9 +69,11 @@ def open_trade(signal_id: int, signal: dict) -> int:
     trade_id = cursor.lastrowid
     conn.close()
 
+    # Distinguish between signal price and actual entry price
+    price_source = "today's open" if signal.get("entry_price_live", 0) > 0 else "signal price"
     print(f"  ✓ Paper order opened: {signal['symbol']} "
           f"{'LONG' if signal['direction']==1 else 'SHORT'} "
-          f"× {signal['qty']} @ ₹{signal['entry_price']}")
+          f"× {signal['qty']} @ ₹{entry_price:.2f} ({price_source})")
 
     return trade_id
 
