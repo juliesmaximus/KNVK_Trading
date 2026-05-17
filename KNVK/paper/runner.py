@@ -1,4 +1,5 @@
 # paper/runner.py — daily scheduler with live Kotak Neo feed
+# FIXED: entry_price_live updated at 9:15 AM + batch API calls + gap filter
 
 import sys
 sys.path.append(str(__import__('pathlib').Path(__file__).parent.parent))
@@ -10,7 +11,9 @@ from datetime import datetime, date, timezone, timedelta
 
 from data.kotak_feed import KotakClient
 from data.downloader import load_symbol
-from paper.signals_daily import generate_signals, get_pending_signals
+from paper.signals_daily import (
+    generate_signals, get_pending_signals, update_signal_with_live_prices
+)
 from paper.order_manager import (
     open_trade, update_trade, get_open_trades, get_daily_summary
 )
@@ -20,7 +23,7 @@ from utils.alerts import (
 )
 from config import DB_PATH, STABLE_SYMBOLS, KOTAK_TOKEN_MAP
 
-# ── IST timezone ───────────────────────────────────────────────────────────────
+# ── IST timezone ──────────────────────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def now_ist() -> datetime:
@@ -34,7 +37,7 @@ def time_ist() -> int:
     return n.hour * 100 + n.minute
 
 
-# ── module-level client ────────────────────────────────────────────────────────
+# ── module-level client ───────────────────────────────────────────────────────
 kotak_client = None
 
 
@@ -86,10 +89,60 @@ def _reauth():
         print(f"Re-auth error: {e}")
 
 
-# ── price feed ─────────────────────────────────────────────────────────────────
+# ── price feed (BATCH optimized) ───────────────────────────────────────────────
+
+def get_ltp_batch(symbols: list) -> dict:
+    """
+    FIX for Bug #2: Get LTP for multiple symbols in ONE batch API call.
+    Much faster than sequential calls. No rate limiting.
+    
+    Returns: {symbol: ltp, ...}
+    """
+    global kotak_client
+    if not kotak_client or not kotak_client.is_authenticated():
+        return {}
+
+    try:
+        # build batch request
+        tokens = [
+            {
+                "instrument_token": KOTAK_TOKEN_MAP[sym],
+                "exchange_segment": "nse_cm"
+            }
+            for sym in symbols
+            if sym in KOTAK_TOKEN_MAP
+        ]
+
+        if not tokens:
+            return {}
+
+        results = kotak_client.get_quote(tokens)
+
+        if not results:
+            return {}
+
+        # map exchange_token back to symbol
+        token_to_sym = {
+            str(v): k for k, v in KOTAK_TOKEN_MAP.items()
+        }
+
+        prices = {}
+        for r in results:
+            exchange_token = str(r.get("exchange_token", ""))
+            ltp = float(r.get("ltp", 0))
+            sym = token_to_sym.get(exchange_token)
+            if sym and ltp > 0:
+                prices[sym] = ltp
+
+        return prices
+
+    except Exception as e:
+        print(f"  Batch LTP error: {e}")
+        return {}
+
 
 def get_ltp(symbol: str) -> float:
-    """Get single LTP via quote call."""
+    """Get single LTP via quote call (fallback)."""
     global kotak_client
     token = KOTAK_TOKEN_MAP.get(symbol)
     if token and kotak_client and kotak_client.is_authenticated():
@@ -139,7 +192,7 @@ def get_latest_price(symbol: str) -> dict:
 
 def save_live_prices():
     """
-    Fetch all symbol prices in ONE batch API call.
+    Fetch all symbol prices in ONE batch API call (Bug #2 fix).
     Much faster, no rate limiting issues.
     """
     global kotak_client
@@ -147,42 +200,16 @@ def save_live_prices():
         return
 
     try:
-        # build batch request for all stable symbols
-        tokens = [
-            {
-                "instrument_token": KOTAK_TOKEN_MAP[sym],
-                "exchange_segment": "nse_cm"
-            }
-            for sym in STABLE_SYMBOLS
-            if sym in KOTAK_TOKEN_MAP
-        ]
-
-        results = kotak_client.get_quote(tokens)
-
-        if not results:
-            return
-
-        # map exchange_token back to symbol
-        token_to_sym = {
-            str(v): k for k, v in KOTAK_TOKEN_MAP.items()
-        }
-
-        prices_data = {}
-        for r in results:
-            exchange_token = str(r.get("exchange_token", ""))
-            ltp = float(r.get("ltp", 0))
-            sym = token_to_sym.get(exchange_token)
-            if sym and ltp > 0:
-                prices_data[sym] = ltp
+        prices = get_ltp_batch(STABLE_SYMBOLS)
 
         price_file = Path(__file__).parent.parent / "journal" / "live_prices.json"
         price_file.parent.mkdir(exist_ok=True)
         with open(price_file, "w") as f:
             json.dump({
                 "timestamp": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
-                "prices":    prices_data
+                "prices":    prices
             }, f)
-        print(f"  Prices saved: {len(prices_data)}/{len(STABLE_SYMBOLS)} symbols")
+        print(f"  Live prices saved: {len(prices)}/{len(STABLE_SYMBOLS)} symbols")
 
     except Exception as e:
         print(f"  Price save error: {e}")
@@ -202,10 +229,15 @@ def is_market_open() -> bool:
 # ── daily phases ───────────────────────────────────────────────────────────────
 
 def run_morning_open():
+    """
+    FIX for Bug #1: Fetch today's opening prices and update signal entries.
+    Before placing any orders, verify gap is within threshold.
+    """
     print(f"\n{'='*55}")
     print(f"MORNING OPEN — {now_ist().strftime('%Y-%m-%d %H:%M')} IST")
     print(f"{'='*55}")
 
+    # STEP 1: Check for carried positions
     existing = get_open_trades()
     if not existing.empty:
         print(f"Carrying {len(existing)} positions from previous session:")
@@ -221,36 +253,73 @@ def run_morning_open():
     existing_symbols = set(existing["symbol"].tolist()) \
                        if not existing.empty else set()
 
+    # STEP 2: Fetch today's pending signals
     today   = today_ist()
     pending = get_pending_signals(today)
 
     if pending.empty:
         print("No new signals for today.")
-    else:
-        new_signals = pending[
-            ~pending["symbol"].isin(existing_symbols)
-        ]
-        print(f"New signals:    {len(new_signals)}")
-        print(f"Already open:   "
-              f"{len(pending) - len(new_signals)} skipped")
+        print(f"Total active positions: {len(existing)}")
+        return
 
-        for _, sig in new_signals.iterrows():
-            open_trade(sig["id"], sig.to_dict())
-            direction = "LONG" if sig["direction"] == 1 else "SHORT"
-            log_decision(
-                sig["symbol"], f"OPEN {direction}",
-                sig["entry_price"],
-                f"ev=Rs{sig['ev_net']:.0f} "
-                f"regime={sig['regime']}"
-            )
-            alert_trade_opened(
-                symbol    = sig["symbol"],
-                direction = direction,
-                entry     = sig["entry_price"],
-                stop      = sig["stop_price"],
-                target1   = sig["target1"],
-                qty       = sig["qty"]
-            )
+    # STEP 3: Fetch today's opening prices via batch API (Bug #2 fix)
+    print(f"\nFetching opening prices for {len(pending)} signals...")
+    opening_prices = get_ltp_batch(pending["symbol"].tolist())
+
+    if not opening_prices:
+        print("  WARNING: Could not fetch opening prices. Using signal prices (risky).")
+    else:
+        print(f"  Got {len(opening_prices)} opening prices")
+
+    # STEP 4: Update signals with live prices + apply gap filter (Bug #1 fix)
+    print(f"\nUpdating signal entry prices (gap filter = 1%):")
+    gap_skipped = 0
+    for _, sig in pending.iterrows():
+        if sig["symbol"] in existing_symbols:
+            print(f"  {sig['symbol']:<15} already open — skipped")
+            continue
+
+        if sig["symbol"] in opening_prices:
+            today_open = opening_prices[sig["symbol"]]
+            # Update signal with live price and check gap
+            if not update_signal_with_live_prices(sig["symbol"], today_open, gap_threshold=0.01):
+                gap_skipped += 1
+        else:
+            print(f"  {sig['symbol']:<15} no opening data — using signal price")
+            update_signal_with_live_prices(sig["symbol"], sig["entry_price_signal"], gap_threshold=0.01)
+
+    # STEP 5: Reload signals (excluding gap-filtered ones)
+    new_pending = get_pending_signals(today)
+    new_signals = new_pending[
+        ~new_pending["symbol"].isin(existing_symbols)
+    ]
+
+    if new_signals.empty:
+        print(f"\nNo tradeable signals after gap filter (skipped {gap_skipped})")
+        print(f"Total active positions: {len(existing)}")
+        return
+
+    print(f"\nOpening {len(new_signals)} positions:")
+    for _, sig in new_signals.iterrows():
+        # Use live entry price, not signal price
+        entry_price = sig["entry_price_live"] if sig["entry_price_live"] > 0 else sig["entry_price_signal"]
+        
+        open_trade(sig["id"], sig.to_dict())
+        direction = "LONG" if sig["direction"] == 1 else "SHORT"
+        log_decision(
+            sig["symbol"], f"OPEN {direction}",
+            entry_price,
+            f"ev=Rs{sig['ev_net']:.0f} "
+            f"regime={sig['regime']}"
+        )
+        alert_trade_opened(
+            symbol    = sig["symbol"],
+            direction = direction,
+            entry     = entry_price,
+            stop      = sig["stop_price"],
+            target1   = sig["target1"],
+            qty       = sig["qty"]
+        )
 
     total = get_open_trades()
     print(f"\nTotal active positions: {len(total)}")
@@ -290,7 +359,7 @@ def run_position_monitor():
                 f"pnl=Rs{result:.0f}"
             )
 
-    # save live prices for dashboard using fast LTP calls
+    # save live prices for dashboard using fast batch LTP calls (Bug #2 fix)
     save_live_prices()
 
 
@@ -351,6 +420,11 @@ def run_paper_trading_loop():
     print(f"Universe: {len(STABLE_SYMBOLS)} stable symbols")
     print(f"Mode: PAPER ONLY — live prices via Kotak Neo")
     print(f"Server time (IST): {now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*55}")
+    print(f"\nFIXES APPLIED:")
+    print(f"  ✓ Bug #1: Entry price updated at 9:15 AM with today's open")
+    print(f"  ✓ Bug #2: Batch API calls (all 17 symbols in 1 request)")
+    print(f"  ✓ Gap filter: Skip trades if gap > 1% from signal price")
     print(f"{'='*55}")
 
     totp = input("\nEnter TOTP for Kotak Neo: ")
@@ -428,10 +502,11 @@ if __name__ == "__main__":
             init_kotak(totp)
             print(f"\n{'Symbol':<15} {'LTP':>10}")
             print("-" * 25)
+            # Use batch call instead of sequential
+            prices = get_ltp_batch(STABLE_SYMBOLS)
             for sym in STABLE_SYMBOLS:
-                ltp = get_ltp(sym)
-                if ltp > 0:
-                    print(f"{sym:<15} Rs{ltp:>9.2f}")
+                if sym in prices:
+                    print(f"{sym:<15} Rs{prices[sym]:>9.2f}")
                 else:
                     print(f"{sym:<15} no data")
 
