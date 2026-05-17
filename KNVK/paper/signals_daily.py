@@ -1,5 +1,6 @@
 # paper/signals_daily.py — end of day signal generator
 # runs at 3:30 PM IST every trading day
+# FIXED: stores yesterday's close, fetches today's open at market open
 
 import sys
 sys.path.append(str(__import__('pathlib').Path(__file__).parent.parent))
@@ -16,27 +17,30 @@ from config import (
 )
 
 
-# ─── DB setup ─────────────────────────────────────────────────────────────────
+# ─── DB setup ──────────────────────────────────────────────────────────────
 
 def init_paper_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS paper_signals (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_date   TEXT,
-            symbol        TEXT,
-            direction     INTEGER,
-            entry_price   REAL,
-            stop_price    REAL,
-            target1       REAL,
-            target2       REAL,
-            atr           REAL,
-            regime        TEXT,
-            qty           INTEGER,
-            trade_value   REAL,
-            ev_net        REAL,
-            status        TEXT DEFAULT 'PENDING',
-            created_at    TEXT,
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_date         TEXT,
+            symbol              TEXT,
+            direction           INTEGER,
+            entry_price_signal  REAL,           -- price used for signal generation (yesterday close)
+            entry_price_live    REAL DEFAULT 0, -- updated at 9:15 AM with today's open
+            stop_price          REAL,
+            target1             REAL,
+            target2             REAL,
+            atr                 REAL,
+            regime              TEXT,
+            qty                 INTEGER,
+            trade_value         REAL,
+            ev_net              REAL,
+            gap_pct             REAL DEFAULT 0, -- gap from signal price to today's open
+            gap_filter_active   INTEGER DEFAULT 0, -- 1 = skipped due to gap
+            status              TEXT DEFAULT 'PENDING',
+            created_at          TEXT,
             UNIQUE(signal_date, symbol)
         )
     """)
@@ -82,7 +86,7 @@ def clear_todays_signals(signal_date: str):
     conn.close()
 
 
-# ─── Signal generation ────────────────────────────────────────────────────────
+# ─── Signal generation (EOD) ───────────────────────────────────────────────────
 
 def generate_signals(
     capital:      float = 500_000,
@@ -93,6 +97,10 @@ def generate_signals(
     Run end-of-day signal generation across stable universe.
     Called at 3:30 PM IST after market close.
     force=True clears existing signals and regenerates.
+    
+    FIX: entry_price stored as "entry_price_signal" (yesterday close)
+    Actual entry_price_live will be updated at 9:15 AM with today's open.
+    
     Returns list of actionable signals for next day.
     """
     if signal_date is None:
@@ -141,7 +149,7 @@ def generate_signals(
             atr        = last_row["atr"]
             regime     = last_row["regime"]
             multiplier = ATR_MULTIPLIER.get(regime, 2.0)
-            entry      = last_row["close"]
+            entry      = last_row["close"]  # yesterday's close
 
             # ATR filter
             if (atr / entry) < MIN_ATR_PCT:
@@ -179,24 +187,25 @@ def generate_signals(
                 continue
 
             signal = {
-                "signal_date":  signal_date,
-                "symbol":       sym,
-                "direction":    direction,
-                "entry_price":  round(entry, 2),
-                "stop_price":   round(stop, 2),
-                "target1":      round(target1, 2),
-                "target2":      round(target2, 2),
-                "atr":          round(atr, 2),
-                "regime":       regime,
-                "qty":          qty,
-                "trade_value":  round(trade_val, 2),
-                "ev_net":       round(ev["ev_net"], 2),
+                "signal_date":       signal_date,
+                "symbol":            sym,
+                "direction":         direction,
+                "entry_price_signal": round(entry, 2),      # yesterday's close
+                "entry_price_live":  0.0,                   # to be updated at 9:15 AM
+                "stop_price":        round(stop, 2),
+                "target1":           round(target1, 2),
+                "target2":           round(target2, 2),
+                "atr":               round(atr, 2),
+                "regime":            regime,
+                "qty":               qty,
+                "trade_value":       round(trade_val, 2),
+                "ev_net":            round(ev["ev_net"], 2),
             }
             signals.append(signal)
 
             direction_str = "LONG" if direction == 1 else "SHORT"
             print(f"  {sym:<20} {direction_str:<6} "
-                  f"entry=₹{entry:<8.2f} "
+                  f"signal_entry=₹{entry:<8.2f} "
                   f"stop=₹{stop:<8.2f} "
                   f"qty={qty:<5} "
                   f"ev=₹{ev['ev_net']:.0f}")
@@ -210,15 +219,17 @@ def generate_signals(
         for s in signals:
             conn.execute("""
                 INSERT OR IGNORE INTO paper_signals
-                (signal_date, symbol, direction, entry_price,
-                 stop_price, target1, target2, atr, regime,
-                 qty, trade_value, ev_net, status, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?)
+                (signal_date, symbol, direction, entry_price_signal,
+                 entry_price_live, stop_price, target1, target2, atr, regime,
+                 qty, trade_value, ev_net, gap_pct, gap_filter_active,
+                 status, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?)
             """, (
                 s["signal_date"], s["symbol"], s["direction"],
-                s["entry_price"], s["stop_price"], s["target1"],
+                s["entry_price_signal"], s["entry_price_live"],
+                s["stop_price"], s["target1"],
                 s["target2"], s["atr"], s["regime"], s["qty"],
-                s["trade_value"], s["ev_net"],
+                s["trade_value"], s["ev_net"], 0.0, 0,
                 datetime.now().isoformat()
             ))
         conn.commit()
@@ -227,6 +238,8 @@ def generate_signals(
     print(f"\n{'─'*50}")
     print(f"Signals generated: {len(signals)}")
     print(f"Saved to DB: {DB_PATH}")
+    print(f"\nNOTE: entry_price_live will be updated at 9:15 AM IST")
+    print(f"      when today's opening price is fetched from Kotak.")
     return signals
 
 
@@ -238,11 +251,76 @@ def get_pending_signals(signal_date: str = None) -> pd.DataFrame:
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql("""
         SELECT * FROM paper_signals
-        WHERE signal_date = ? AND status = 'PENDING'
+        WHERE signal_date = ? AND status = 'PENDING' AND gap_filter_active = 0
         ORDER BY ev_net DESC
     """, conn, params=(signal_date,))
     conn.close()
     return df
+
+
+def update_signal_with_live_prices(symbol: str, today_open: float, gap_threshold: float = 0.01) -> bool:
+    """
+    FIX for Bug #1: Update signal entry price with today's opening price.
+    Called at 9:15 AM IST before placing orders.
+    
+    Args:
+        symbol: stock symbol
+        today_open: actual opening price from Kotak
+        gap_threshold: skip trade if gap > this percentage (default 1%)
+    
+    Returns:
+        True if signal updated and tradeable, False if skipped due to gap
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    signal_date = date.today().strftime("%Y-%m-%d")
+    
+    # fetch signal
+    cursor.execute("""
+        SELECT id, entry_price_signal, direction, stop_price, target1, target2
+        FROM paper_signals
+        WHERE signal_date = ? AND symbol = ? AND status = 'PENDING'
+    """, (signal_date, symbol))
+    
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False
+    
+    signal_id, entry_signal, direction, stop, target1, target2 = row
+    
+    # calculate gap
+    gap_pct = abs(today_open - entry_signal) / entry_signal
+    gap_active = 1 if gap_pct > gap_threshold else 0
+    
+    if gap_active:
+        # mark as inactive due to gap
+        cursor.execute("""
+            UPDATE paper_signals
+            SET entry_price_live = ?, gap_pct = ?, gap_filter_active = 1,
+                status = 'SKIPPED'
+            WHERE id = ?
+        """, (today_open, gap_pct, signal_id))
+        print(f"    {symbol:<15} GAP FILTER: {gap_pct*100:.2f}% > {gap_threshold*100:.1f}% "
+              f"(signal {entry_signal:.2f} vs open {today_open:.2f}) — SKIPPED")
+        conn.commit()
+        conn.close()
+        return False
+    
+    # update with live price
+    cursor.execute("""
+        UPDATE paper_signals
+        SET entry_price_live = ?, gap_pct = ?, gap_filter_active = 0
+        WHERE id = ?
+    """, (today_open, gap_pct, signal_id))
+    
+    print(f"    {symbol:<15} entry updated: {entry_signal:.2f} → {today_open:.2f} "
+          f"(gap {gap_pct*100:.2f}%)")
+    
+    conn.commit()
+    conn.close()
+    return True
 
 
 if __name__ == "__main__":
@@ -252,13 +330,14 @@ if __name__ == "__main__":
     if signals:
         print(f"\nTop signal:")
         s = signals[0]
-        print(f"  Symbol:    {s['symbol']}")
-        print(f"  Direction: {'LONG' if s['direction']==1 else 'SHORT'}")
-        print(f"  Entry:     ₹{s['entry_price']}")
-        print(f"  Stop:      ₹{s['stop_price']}")
-        print(f"  Target1:   ₹{s['target1']}")
-        print(f"  Target2:   ₹{s['target2']}")
-        print(f"  Qty:       {s['qty']}")
-        print(f"  EV:        ₹{s['ev_net']}")
+        print(f"  Symbol:              {s['symbol']}")
+        print(f"  Direction:           {'LONG' if s['direction']==1 else 'SHORT'}")
+        print(f"  Entry (signal):      ₹{s['entry_price_signal']}")
+        print(f"  Entry (live):        ₹{s['entry_price_live']} (updated at 9:15 AM)")
+        print(f"  Stop:                ₹{s['stop_price']}")
+        print(f"  Target1:             ₹{s['target1']}")
+        print(f"  Target2:             ₹{s['target2']}")
+        print(f"  Qty:                 {s['qty']}")
+        print(f"  EV:                  ₹{s['ev_net']}")
     else:
         print("No signals today.")
